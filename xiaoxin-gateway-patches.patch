@@ -1,0 +1,176 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 1c9fec0af..7f846af96 100644
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -1226,6 +1226,17 @@ class WeixinAdapter(BasePlatformAdapter):
+             default=False,
+         )
+ 
++        # Text message batching: merge rapid successive messages so the agent
++        # sees one combined turn instead of replying to each fragment.
++        # WeChat users often split thoughts across 2-3 messages on mobile;
++        # 3 seconds covers the typical inter-message gap.
++        self._text_batch_delay_seconds = float(
++            extra.get("text_batch_delay_seconds")
++            or os.getenv("WEIXIN_TEXT_BATCH_DELAY_SECONDS", "3.0")
++        )
++        self._pending_text_batches: Dict[str, MessageEvent] = {}
++        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
++
+         if self._account_id and not self._token:
+             persisted = load_weixin_account(hermes_home, self._account_id)
+             if persisted:
+@@ -1441,7 +1452,21 @@ class WeixinAdapter(BasePlatformAdapter):
+             timestamp=datetime.now(),
+         )
+         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
+-        await self.handle_message(event)
++
++        # Batch plain text messages so multi-part user thoughts are merged
++        # into a single agent turn.  When a media message arrives, flush
++        # any pending text batch first to avoid "Interrupting" messages.
++        if (
++            text
++            and not media_paths
++            and self._text_batch_delay_seconds > 0
++        ):
++            self._enqueue_text_event(event)
++        else:
++            # Flush any pending text batch before dispatching media/commands
++            # so they don't collide and trigger interrupt messages.
++            await self._flush_pending_batch_for_event(event)
++            await self.handle_message(event)
+ 
+     def _is_dm_allowed(self, sender_id: str) -> bool:
+         if self._dm_policy == "disabled":
+@@ -1450,6 +1475,109 @@ class WeixinAdapter(BasePlatformAdapter):
+             return sender_id in self._allow_from
+         return True
+ 
++    # ------------------------------------------------------------------
++    # Text message batching (merge rapid successive messages)
++    # ------------------------------------------------------------------
++
++    def _text_batch_key(self, event: MessageEvent) -> str:
++        """Session-scoped key for text message batching."""
++        from gateway.session import build_session_key
++        return build_session_key(
++            event.source,
++            group_sessions_per_user=True,
++        )
++
++    def _enqueue_text_event(self, event: MessageEvent) -> None:
++        """Buffer a text event and reset the flush timer.
++
++        When a user sends multiple messages in quick succession (common on
++        mobile), this merges them into a single event so the agent replies
++        once instead of to each fragment.
++        """
++        key = self._text_batch_key(event)
++        existing = self._pending_text_batches.get(key)
++        if existing is None:
++            self._pending_text_batches[key] = event
++        else:
++            if event.text:
++                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
++            # Keep the latest message_id for dedup
++            if event.message_id:
++                existing.message_id = event.message_id
++
++        prior_task = self._pending_text_batch_tasks.get(key)
++        if prior_task and not prior_task.done():
++            prior_task.cancel()
++        self._pending_text_batch_tasks[key] = asyncio.create_task(
++            self._flush_text_batch(key)
++        )
++
++    async def _flush_text_batch(self, key: str) -> None:
++        """Wait for the quiet period then dispatch the aggregated text.
++
++        If the agent is already busy processing a message for this session,
++        waits until it finishes before dispatching to avoid "Interrupting"
++        messages.
++        """
++        current_task = asyncio.current_task()
++        try:
++            await asyncio.sleep(self._text_batch_delay_seconds)
++
++            # If the agent is busy for this session, wait for it to finish.
++            # _active_sessions contains entries while the agent is processing.
++            wait_count = 0
++            while key in self._active_sessions:
++                wait_count += 1
++                if wait_count == 1:
++                    logger.info(
++                        "[Weixin] Text batch for %s waiting for agent to finish...",
++                        key,
++                    )
++                await asyncio.sleep(0.5)
++                # Cap the wait so we don't block forever (30 seconds max)
++                if wait_count >= 60:
++                    logger.warning(
++                        "[Weixin] Text batch for %s timed out waiting for agent", key
++                    )
++                    break
++
++            event = self._pending_text_batches.pop(key, None)
++            if not event:
++                return
++            logger.info(
++                "[Weixin] Flushing text batch %s (%d chars)",
++                key, len(event.text or ""),
++            )
++            await asyncio.shield(self.handle_message(event))
++        except asyncio.CancelledError:
++            pass
++        finally:
++            if self._pending_text_batch_tasks.get(key) is current_task:
++                self._pending_text_batch_tasks.pop(key, None)
++
++    async def _flush_pending_batch_for_event(self, event: MessageEvent) -> None:
++        """Flush any pending text batch for the same session before dispatching.
++
++        When a media message (image, video, etc.) arrives while a text batch
++        is pending, we flush the batch immediately so the two don't collide
++        and trigger an "Interrupting" message.
++        """
++        key = self._text_batch_key(event)
++        pending = self._pending_text_batches.pop(key, None)
++        if pending:
++            # Cancel the scheduled flush task
++            prior_task = self._pending_text_batch_tasks.pop(key, None)
++            if prior_task and not prior_task.done():
++                prior_task.cancel()
++            logger.info(
++                "[Weixin] Flushing pending text batch for %s before media dispatch (%d chars)",
++                key, len(pending.text or ""),
++            )
++            # Dispatch the batched text first, then the media message will
++            # be dispatched by the caller.  Use shield so the caller's
++            # handle_message can't cancel this dispatch.
++            await asyncio.shield(self.handle_message(pending))
++
+     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+         item_type = item.get("type")
+         if item_type == ITEM_IMAGE:
+diff --git a/gateway/run.py b/gateway/run.py
+index 0f56ad61c..8fe09c6b6 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -8509,6 +8509,17 @@ class GatewayRunner:
+             )
+             response = _sanitize_gateway_final_response(source.platform, response)
+ 
++            # Support [SILENT] marker in gateway responses (same convention as
++            # cron jobs).  When the agent decides not to reply — e.g. the
++            # conversation has naturally ended — it outputs "[SILENT]" and we
++            # suppress delivery so no message is sent to the user.
++            if response and "[SILENT]" in response.upper():
++                logger.info(
++                    "[%s] Agent returned [SILENT] — suppressing response for session %s",
++                    source.platform, session_key or "?",
++                )
++                response = ""
++
+             # If the agent's session_id changed during compression, update
+             # session_entry so transcript writes below go the current session.
