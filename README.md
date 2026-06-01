@@ -147,8 +147,9 @@
 1. 创建 wechat profile：`hermes profile create wechat --clone`
 2. 将 `SOUL.md` 复制到 `~/.hermes/profiles/wechat/SOUL.md`
 3. 将 `relationship.json` 复制到 `~/.hermes/profiles/wechat/relationship.json`
-4. 配置微信接入信息到 profile 的 `.env`
-5. 启动 gateway：`wechat gateway start`
+4. 配置微信接入信息到 profile 的 `.env`（`WEIXIN_*` 变量）
+5. 配置模型到 profile 的 `config.yaml`（默认用小米 mimo-v2.5-pro）
+6. 启动 gateway：`wechat gateway start`
 
 ### 定时任务创建
 部署后需要手动创建4个定时任务（通过 `hermes cron` 或 cronjob 工具）。
