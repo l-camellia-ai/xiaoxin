@@ -1,0 +1,25 @@
+# 小欣 profile 配置模板
+# 复制此文件到 ~/.hermes/profiles/wechat/config.yaml
+# 只需要改下面的模型配置，其他保持默认
+
+model:
+  default: mimo-v2.5-pro          # 模型名称
+  provider: xiaomi                 # 提供商
+  base_url: https://token-plan-cn.xiaomimimo.com/v1  # API 地址
+  api_key: YOUR_API_KEY_HERE       # 替换为你的 API Key
+
+# 以下是默认配置，一般不需要改
+display:
+  personality: xiaoxin
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+compression:
+  enabled: true
+  threshold: 0.5
+  target_ratio: 0.2
+  protect_last_n: 20
+agent:
+  max_turns: 90
